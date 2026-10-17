@@ -21,6 +21,7 @@ from srunner.scenariomanager.timer import GameTime
 from srunner.scenarios.basic_scenario import BasicScenario
 from srunner.tools.openscenario_parser import OpenScenarioParser, oneshot_with_check, ParameterRef
 from srunner.tools.py_trees_port import Decorator
+from srunner.tools.ros2_logger import get_logger
 
 
 def repeatable_behavior(behaviour, name=None):
@@ -87,6 +88,7 @@ class StoryElementStatusToBlackboard(Decorator):
         self.story_element_type = story_element_type
         self.element_name = element_name
         self.blackboard = py_trees.blackboard.Blackboard()
+        self.ros2_logger = get_logger()
 
     def initialise(self):
         """
@@ -97,6 +99,18 @@ class StoryElementStatusToBlackboard(Decorator):
                                     self.element_name, "START"),
             value=GameTime.get_time(),
             overwrite=True
+        )
+        # 清除终止标志，允许重新运行
+        termination_flag = "({}){}-TERMINATED".format(self.story_element_type.upper(), self.element_name)
+        if hasattr(self.blackboard, termination_flag):
+            delattr(self.blackboard, termination_flag)
+        
+        # ===== ROS2 JSON日志输出 =====
+        self.ros2_logger.log(
+            GameTime.get_time(),
+            self.story_element_type.upper(),
+            self.element_name,
+            "RUNNING"
         )
 
     def update(self):
@@ -110,6 +124,11 @@ class StoryElementStatusToBlackboard(Decorator):
         """
         Terminate and mark Blackboard entry with END
         """
+        # 使用黑板变量来跟踪是否已经终止过，避免重复输出
+        termination_flag = "({}){}-TERMINATED".format(self.story_element_type.upper(), self.element_name)
+        if hasattr(self.blackboard, termination_flag):
+            return
+            
         # Report whether we ended with End or Cancel
         # If we were ended or cancelled, our state will be INVALID and
         # We will have an ancestor (a parallel SUCCESS_ON_ALL) with a successful child/children
@@ -137,12 +156,22 @@ class StoryElementStatusToBlackboard(Decorator):
         rules = rules or ["END"]
 
         for rule in rules:
+            # === ROS2 JSON日志输出 ===
+            self.ros2_logger.log(
+                GameTime.get_time(),
+                self.story_element_type.upper(),
+                self.element_name,
+                rule
+            )
             self.blackboard.set(
                 name="({}){}-{}".format(self.story_element_type.upper(),
                                         self.element_name, rule),
                 value=GameTime.get_time(),
                 overwrite=True
             )
+            
+        # 设置终止标志到黑板，确保只执行一次终止逻辑
+        self.blackboard.set(name=termination_flag, value=True, overwrite=True)
 
 
 def get_xml_path(tree, node):

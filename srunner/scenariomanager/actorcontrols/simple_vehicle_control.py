@@ -24,6 +24,33 @@ from srunner.scenariomanager.actorcontrols.visualizer import Visualizer
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
 
+# The obstacle sensor only fires a callback when it actually detects something -- there is
+# no "nothing ahead" event -- so a stored reading has to be aged out explicitly.
+#
+# Keep this generous. The sensor does not report on every tick even while an obstacle is
+# plainly in front of the actor, so a tight window reads those delivery gaps as "road clear"
+# and lets the actor lurch into a vehicle it was correctly holding behind. What this guards
+# against is a reading that is *seconds* stale, so half a second of slack at the default
+# 20Hz is ample.
+OBSTACLE_MAX_AGE_FRAMES = 10
+
+# Default gap to keep behind a leading obstacle, in metres. Overridable per scenario with
+# the (standoff_distance, float) controller property.
+DEFAULT_STANDOFF_DISTANCE = 5.0
+
+# A CARLA vehicle standing still still reports a few centimetres per second of velocity
+# jitter. Anything below this is read as stopped, so a follower holding at the standoff
+# distance does not creep forward chasing that noise.
+OBSTACLE_SPEED_DEADBAND = 0.1
+
+# Deceleration the follower plans its approach with, as a fraction of max_deceleration (which
+# is the emergency limit). Planning against the full value starts braking at the last possible
+# moment and overshoots the standoff distance.
+FOLLOW_DECEL_FACTOR = 0.5
+
+# Deceleration assumed when the actor declares no max_deceleration, in m/s^2.
+DEFAULT_FOLLOW_DECELERATION = 10.0
+
 
 class SimpleVehicleControl(BasicControl):
 
@@ -56,6 +83,8 @@ class SimpleVehicleControl(BasicControl):
                                                                                this vehicle
                                         (max_acceleration, float)            - Use a reasonable acceleration value for
                                                                                this vehicle
+                                        (standoff_distance, float)           - Gap to keep behind a leading obstacle
+                                                                               (defaults to 5.0m)
                                         (attach_camera, true/false)          - Attach OpenCV display to actor
                                                                                (useful for debugging)
 
@@ -80,6 +109,15 @@ class SimpleVehicleControl(BasicControl):
             Defaults to infinity.
         _obstacle_actor (carla.Actor): Closest obstacle returned by the obstacle sensor
             Defaults to None.
+        _obstacle_frame (int): Frame the obstacle sensor last reported in. Used to age out a
+            stale reading, since the sensor never reports the absence of an obstacle.
+            Defaults to -1.
+        _standoff_distance (float): Gap the controller aims to keep behind a leading obstacle.
+            Defaults to DEFAULT_STANDOFF_DISTANCE.
+        _last_target_speed (float): Speed commanded on the previous step. The acceleration and
+            deceleration limits are applied against this rather than against the measured speed,
+            which would otherwise feed the actor's own physics back into its next command.
+            Defaults to None (seeded from the measured speed on the first step).
     """
 
     def __init__(self, actor, args=None):
@@ -95,6 +133,9 @@ class SimpleVehicleControl(BasicControl):
         self._obstacle_sensor = None
         self._obstacle_distance = float('inf')
         self._obstacle_actor = None
+        self._obstacle_frame = -1
+        self._standoff_distance = DEFAULT_STANDOFF_DISTANCE
+        self._last_target_speed = None
 
         self._visualizer = None
 
@@ -122,6 +163,9 @@ class SimpleVehicleControl(BasicControl):
         if args and 'max_acceleration' in args:
             self._max_acceleration = float(args['max_acceleration'])
 
+        if args and 'standoff_distance' in args:
+            self._standoff_distance = max(float(args['standoff_distance']), 0.0)
+
         if args and 'attach_camera' in args and strtobool(args['attach_camera']):
             self._visualizer = Visualizer(self._actor)
 
@@ -136,6 +180,7 @@ class SimpleVehicleControl(BasicControl):
             return
         self._obstacle_distance = event.distance
         self._obstacle_actor = event.other_actor
+        self._obstacle_frame = event.frame
 
     def reset(self):
         """
@@ -267,22 +312,52 @@ class SimpleVehicleControl(BasicControl):
         current_speed = math.sqrt(self._actor.get_velocity().x**2 + self._actor.get_velocity().y**2)
 
         if self._consider_obstacles:
+            # Age out the last sensor reading. Without this the most recent detection is kept
+            # forever, so a single close-range reading pins the actor at a standstill for the
+            # rest of the run, whatever is or is not in front of it.
+            if GameTime.get_frame() - self._obstacle_frame > OBSTACLE_MAX_AGE_FRAMES:
+                self._obstacle_distance = float('inf')
+                self._obstacle_actor = None
+
             # If distance is less than the proximity threshold, adapt velocity
-            if self._obstacle_distance < self._proximity_threshold:
-                distance = max(self._obstacle_distance, 0)
+            if (self._obstacle_distance < self._proximity_threshold and
+                    self._obstacle_actor is not None and self._obstacle_actor.is_alive):
+                current_speed_other = math.sqrt(
+                    self._obstacle_actor.get_velocity().x**2 + self._obstacle_actor.get_velocity().y**2)
+                if current_speed_other < OBSTACLE_SPEED_DEADBAND:
+                    current_speed_other = 0.0
+                # Brake towards the leading actor's speed at _standoff_distance rather than at a
+                # zero gap: matching speeds only as the gap reaches 0 means the actor always ends
+                # up touching the obstacle, and a touching obstacle reports distance == 0.
+                distance = self._obstacle_distance - self._standoff_distance
                 if distance > 0:
-                    current_speed_other = math.sqrt(
-                        self._obstacle_actor.get_velocity().x**2 + self._obstacle_actor.get_velocity().y**2)
-                    if current_speed_other < current_speed:
-                        acceleration = -0.5 * (current_speed - current_speed_other)**2 / distance
-                        target_speed = max(acceleration * (current_time - self._last_update) + current_speed, 0)
+                    # Cap the command at the speed the remaining gap can still absorb. Overwriting
+                    # it with a value derived from the *measured* speed instead makes every metre
+                    # per second lost to a gradient or to cornering scrub the new ceiling, and
+                    # leaves the acceleration branch below unreachable while an obstacle is in range.
+                    decel = self._max_deceleration or DEFAULT_FOLLOW_DECELERATION
+                    target_speed = min(target_speed, current_speed_other + math.sqrt(
+                        2.0 * FOLLOW_DECEL_FACTOR * decel * distance))
                 else:
-                    target_speed = 0
+                    # Inside the standoff distance: follow the obstacle's own speed, tapering to a
+                    # stop as the gap closes. Commanding a flat 0 here made the actor stop dead and
+                    # never release once the obstacle moved away again.
+                    taper = min(max(self._obstacle_distance, 0) / max(self._standoff_distance, 0.1), 1.0)
+                    target_speed = min(target_speed, current_speed_other * taper)
 
         if self._consider_traffic_lights:
             if (self._actor.is_at_traffic_light() and
                     self._actor.get_traffic_light_state() == carla.TrafficLightState.Red):
                 target_speed = 0
+
+        # The rate limits below are applied against the previously commanded speed, not against
+        # the measured one. This controller writes velocity straight into the physics engine and
+        # derives its yaw rate from the commanded speed, so clamping against the measured speed
+        # closes a feedback loop: cornering scrub lowers the measured speed, which lowers the next
+        # command, which lowers the yaw rate, which increases the scrub. That converges to a crawl
+        # of a few tenths of a metre per second which the actor never recovers from.
+        if self._last_target_speed is None:
+            self._last_target_speed = current_speed
 
         if target_speed < current_speed:
             if not self._brake_lights_active:
@@ -291,8 +366,8 @@ class SimpleVehicleControl(BasicControl):
                 light_state |= carla.VehicleLightState.Brake
                 self._actor.set_light_state(carla.VehicleLightState(light_state))
             if self._max_deceleration is not None:
-                target_speed = max(target_speed, current_speed - (current_time -
-                                                                  self._last_update) * self._max_deceleration)
+                target_speed = max(target_speed, self._last_target_speed - (current_time -
+                                                                           self._last_update) * self._max_deceleration)
         else:
             if self._brake_lights_active:
                 self._brake_lights_active = False
@@ -300,11 +375,13 @@ class SimpleVehicleControl(BasicControl):
                 light_state &= ~carla.VehicleLightState.Brake
                 self._actor.set_light_state(carla.VehicleLightState(light_state))
             if self._max_acceleration is not None:
-                tmp_speed = min(target_speed, current_speed + (current_time -
-                                                               self._last_update) * self._max_acceleration)
+                tmp_speed = min(target_speed, self._last_target_speed + (current_time -
+                                                                        self._last_update) * self._max_acceleration)
                 # If the tmp_speed is < 0.5 the vehicle may not properly accelerate.
                 # Therefore, we bump the speed to 0.5 m/s if target_speed allows.
                 target_speed = max(tmp_speed, min(0.5, target_speed))
+
+        self._last_target_speed = target_speed
 
         # set new linear velocity
         velocity = carla.Vector3D(0, 0, 0)

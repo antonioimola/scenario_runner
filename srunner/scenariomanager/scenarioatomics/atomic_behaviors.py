@@ -423,6 +423,11 @@ class ChangeActorTargetSpeed(AtomicBehavior):
             Defaults to None.
         distance (float): Distance of the maneuver [m].
             Defaults to None.
+        rate (float): Constant acceleration/deceleration rate to reach target_speed [m/s2].
+            If set, target_speed is approached linearly at this rate, starting from the
+            actor's speed at initialise() time, instead of being applied as a step.
+            Takes precedence over duration/distance for determining when the maneuver ends.
+            Defaults to None.
         relative_actor (carla.Actor): If the target speed setting should be relative to another actor.
             Defaults to None.
         value (float): Offset, if the target speed setting should be relative to another actor.
@@ -442,9 +447,13 @@ class ChangeActorTargetSpeed(AtomicBehavior):
             Defaults to None.
         _start_location (carla.Location): Start location of the atomic.
             Defaults to None.
+        _start_speed (float): Actor speed at the time the atomic was initialised [m/s].
+            Defaults to None.
         _duration (float): Duration of the maneuver [s].
             Defaults to None.
         _distance (float): Distance of the maneuver [m].
+            Defaults to None.
+        _rate (float): Constant acceleration/deceleration rate to reach target_speed [m/s2].
             Defaults to None.
         _relative_actor (carla.Actor): If the target speed setting should be relative to another actor.
             Defaults to None.
@@ -457,7 +466,7 @@ class ChangeActorTargetSpeed(AtomicBehavior):
     """
 
     def __init__(self, actor, target_speed, init_speed=False,
-                 duration=None, distance=None, relative_actor=None,
+                 duration=None, distance=None, rate=None, relative_actor=None,
                  value=None, value_type=None, continuous=False, name="ChangeActorTargetSpeed"):
         """
         Setup parameters
@@ -469,6 +478,7 @@ class ChangeActorTargetSpeed(AtomicBehavior):
 
         self._start_time = None
         self._start_location = None
+        self._start_speed = None
 
         self._relative_actor = relative_actor
         self._value = value
@@ -476,6 +486,7 @@ class ChangeActorTargetSpeed(AtomicBehavior):
         self._continuous = continuous
         self._duration = duration
         self._distance = distance
+        self._rate = rate
 
     def initialise(self):
         """
@@ -498,6 +509,7 @@ class ChangeActorTargetSpeed(AtomicBehavior):
 
         self._start_time = GameTime.get_time()
         self._start_location = CarlaDataProvider.get_location(self._actor)
+        self._start_speed = CarlaDataProvider.get_velocity(self._actor)
 
         if self._relative_actor:
             relative_velocity = CarlaDataProvider.get_velocity(self._relative_actor)
@@ -510,7 +522,11 @@ class ChangeActorTargetSpeed(AtomicBehavior):
             else:
                 print('self._value_type must be delta or factor')
 
-        actor_dict[self._actor.id].update_target_speed(self._target_speed, start_time=self._start_time)
+        if self._rate is not None:
+            # Ramp towards target_speed at a constant rate, starting from the current speed
+            actor_dict[self._actor.id].update_target_speed(self._start_speed, start_time=self._start_time)
+        else:
+            actor_dict[self._actor.id].update_target_speed(self._target_speed, start_time=self._start_time)
 
         if self._init_speed:
             actor_dict[self._actor.id].set_init_speed()
@@ -552,8 +568,24 @@ class ChangeActorTargetSpeed(AtomicBehavior):
             else:
                 print('self._value_type must be delta or factor')
 
+        if not self._continuous and self._rate is not None:
+            # Ramp the commanded speed towards the target at a constant rate [m/s2],
+            # independent of the underlying controller's own acceleration handling
+            elapsed_time = GameTime.get_time() - self._start_time
+            sign = 1.0 if self._target_speed >= self._start_speed else -1.0
+            commanded_speed = self._start_speed + sign * float(self._rate) * elapsed_time
+            if sign > 0:
+                commanded_speed = min(commanded_speed, self._target_speed)
+            else:
+                commanded_speed = max(commanded_speed, self._target_speed)
+
+            actor_dict[self._actor.id].update_target_speed(commanded_speed)
+
+            if commanded_speed == self._target_speed:
+                new_status = py_trees.common.Status.SUCCESS
+
         # check duration and driven_distance
-        if not self._continuous:
+        elif not self._continuous:
             if (self._duration is not None) and (GameTime.get_time() - self._start_time > self._duration):
                 new_status = py_trees.common.Status.SUCCESS
 
@@ -561,7 +593,7 @@ class ChangeActorTargetSpeed(AtomicBehavior):
             if (self._distance is not None) and (driven_distance > self._distance):
                 new_status = py_trees.common.Status.SUCCESS
 
-        if self._distance is None and self._duration is None:
+        if self._distance is None and self._duration is None and self._rate is None:
             new_status = py_trees.common.Status.SUCCESS
 
         return new_status
@@ -791,6 +823,33 @@ class ChangeActorWaypoints(AtomicBehavior):
                 osc_point)
             carla_route_elements.append((carla_transforms, routing_option))
 
+        # The seed waypoint one metre ahead of the actor, and the lane tangent
+        # there. Hoisted out of the `i == 0` branch below, where it used to be
+        # computed: it is ALSO the heading reference the filter falls back on
+        # whenever `route` holds fewer than two points, and a route whose first
+        # waypoint is "shortest" reaches that fallback with the variable never
+        # bound -- UnboundLocalError, and the run dies in initialise().
+        #
+        # Only a route that mixes "shortest" and "fastest" waypoints can reach
+        # it (a shortest-only route never enters the else branch at all, and a
+        # fastest-first one binds the variable on i == 0), which is why stock
+        # 0.9.15 carries the same bug unnoticed. FollowTrajectoryAction tags
+        # every vertex "shortest" and AssignRouteAction emitted one strategy for
+        # the whole route, so until per-waypoint strategies existed nothing ever
+        # produced the mixed case.
+        # AttributeError as well as IndexError: get_waypoint() returns None for an
+        # actor with no road anywhere near it, and this now runs for every route
+        # rather than only for one starting "fastest". Leaving ego_next_wp as None
+        # there keeps a shortest-only route working exactly as it did before the
+        # hoist -- it never reads the seed -- instead of turning a working
+        # trajectory into an AttributeError.
+        mmap = CarlaDataProvider.get_map()
+        ego_waypoint = mmap.get_waypoint(CarlaDataProvider.get_location(self._actor))
+        try:
+            ego_next_wp = ego_waypoint.next(1)[0]
+        except (IndexError, AttributeError):
+            ego_next_wp = ego_waypoint
+
         # Obtain final route, considering the routing option
         # At the moment everything besides "shortest" will use the CARLA GlobalPlanner
         grp = GlobalRoutePlanner(CarlaDataProvider.get_world().get_map(), 2.0)
@@ -800,13 +859,6 @@ class ChangeActorWaypoints(AtomicBehavior):
                 route.append(carla_route_elements[i][0])
             else:
                 if i == 0:
-                    mmap = CarlaDataProvider.get_map()
-                    ego_location = CarlaDataProvider.get_location(self._actor)
-                    ego_waypoint = mmap.get_waypoint(ego_location)
-                    try:
-                        ego_next_wp = ego_waypoint.next(1)[0]
-                    except IndexError:
-                        ego_next_wp = ego_waypoint
                     waypoint = ego_next_wp.transform.location
                 else:
                     waypoint = carla_route_elements[i - 1][0].location
@@ -825,12 +877,26 @@ class ChangeActorWaypoints(AtomicBehavior):
                         new_heading = np.arctan2(new_heading_vec.y, new_heading_vec.x)
                         if len(route) > 1:
                             last_heading_vec = route[-1].location - route[-2].location
+                            # A reference vector shorter than this is too close to zero-length to
+                            # give a meaningful heading, and would otherwise reject the rest of a
+                            # legitimate route.
+                            if last_heading_vec.length() < 0.5:
+                                route.append(wp_tuple[0].transform)
+                                continue
+                            last_heading = np.arctan2(last_heading_vec.y, last_heading_vec.x)
                         else:
-                            last_heading_vec = route[-1].location - ego_next_wp.transform.location
-                        last_heading = np.arctan2(last_heading_vec.y, last_heading_vec.x)
+                            # Seed the reference from the lane tangent at ego_next_wp rather than
+                            # from (route[0] - ego_next_wp): those two points are ~1 m apart and
+                            # can land either side of ego_next_wp, which can point the reference
+                            # backwards and collapse the whole route to a single transform.
+                            forward_vec = ego_next_wp.transform.get_forward_vector()
+                            last_heading = np.arctan2(forward_vec.y, forward_vec.x)
 
                         heading_delta = math.fabs(new_heading - last_heading)
-                        if math.fabs(heading_delta) < 0.5 or math.fabs(heading_delta) > 5.5:
+                        # Reject only genuine reversals (115-246 deg band around 180 deg).
+                        # A tighter band also rejects the router's lane-change chord (~31 deg
+                        # off heading), truncating the route.
+                        if math.fabs(heading_delta) < 2.0 or math.fabs(heading_delta) > 4.3:
                             route.append(wp_tuple[0].transform)
                     elif not route:
                         route.append(wp_tuple[0].transform)
@@ -1129,6 +1195,23 @@ class ChangeActorLaneOffset(AtomicBehavior):
 
         if actor_dict[self._actor.id].get_last_waypoint_command() != self._start_time:
             return py_trees.common.Status.SUCCESS
+        
+        if not self._relative_actor:
+            # A NON-relative LaneOffsetAction has no other actor to track, so nothing else
+            # ever assigns _current_target_offset and it keeps its __init__ value of 0. The
+            # completion test below then asks "is the actor within OFFSET_THRESHOLD of its
+            # LANE CENTRE" instead of "has it reached the commanded offset" — true on the
+            # first update() for any vehicle sitting on its centreline, so the atomic reports
+            # SUCCESS immediately and terminate() resets the offset initialise() had just
+            # applied. The commanded drift is wiped before the car moves at all.
+            #
+            # Measured in this repo on identical drift XML: the actor moves on Town04 (a
+            # curved road, where simple_vehicle_control oscillates ±0.20-0.33 m about the
+            # centreline and so lands OUTSIDE the 0.1 m window) and does not move on Town12
+            # (a straight road, tracked to ±0.001 m, inside the window every tick). The bug
+            # is therefore not "drift never works" but "drift works or not depending on road
+            # curvature", which is much harder to notice than an outright failure.
+            self._current_target_offset = self._offset
 
         if self._relative_actor:
             # Calculate new offset
@@ -1197,7 +1280,6 @@ class ChangeActorLaneOffset(AtomicBehavior):
             self._overwritten = True
 
         super(ChangeActorLaneOffset, self).terminate(new_status)
-
 
 class ChangeLateralDistance(AtomicBehavior):
     """

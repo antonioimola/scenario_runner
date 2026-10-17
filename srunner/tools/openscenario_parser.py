@@ -1176,13 +1176,16 @@ class OpenScenarioParser(object):
                 if private_action.find('SpeedAction') is not None:
                     long_maneuver = private_action.find('SpeedAction')
 
-                    # duration and distance
+                    # duration, distance and rate
                     distance = float('inf')
                     duration = float('inf')
+                    rate = None
                     dimension = long_maneuver.find("SpeedActionDynamics").attrib.get('dynamicsDimension')
                     if dimension == "distance":
                         distance = ParameterRef(long_maneuver.find("SpeedActionDynamics").attrib.get(
                             'value', float("inf")))
+                    elif dimension == "rate":
+                        rate = ParameterRef(long_maneuver.find("SpeedActionDynamics").attrib.get('value', 0))
                     else:
                         duration = ParameterRef(long_maneuver.find("SpeedActionDynamics").attrib.get(
                             'value', float("inf")))
@@ -1192,7 +1195,8 @@ class OpenScenarioParser(object):
                         target_speed = ParameterRef(long_maneuver.find("SpeedActionTarget").find(
                             "AbsoluteTargetSpeed").attrib.get('value', 0))
                         atomic = ChangeActorTargetSpeed(
-                            actor, float(target_speed), distance=distance, duration=duration, name=maneuver_name)
+                            actor, float(target_speed), distance=distance, duration=duration,
+                            rate=rate, name=maneuver_name)
 
                     # relative velocity to given actor
                     if long_maneuver.find("SpeedActionTarget").find("RelativeTargetSpeed") is not None:
@@ -1215,6 +1219,7 @@ class OpenScenarioParser(object):
                                                         continuous=continuous,
                                                         distance=distance,
                                                         duration=duration,
+                                                        rate=rate,
                                                         name=maneuver_name)
 
                 elif private_action.find('LongitudinalDistanceAction') is not None:

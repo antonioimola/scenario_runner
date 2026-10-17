@@ -34,6 +34,7 @@ from srunner.scenariomanager.scenarioatomics.atomic_behaviors import (TrafficLig
                                                                       ChangeActorWaypoints,
                                                                       ChangeActorLateralMotion,
                                                                       ChangeActorLaneOffset,
+                                                                      ChangeLateralDistance,
                                                                       SyncArrivalOSC,
                                                                       KeepLongitudinalGap,
                                                                       Idle,
@@ -891,8 +892,8 @@ class OpenScenarioParser(object):
                     condition_rule = headtime_condition.attrib.get('rule')
                     condition_operator = OpenScenarioParser.operators[condition_rule]
 
-                    condition_freespace = strtobool(headtime_condition.attrib.get('freespace', False))
-                    condition_along_route = strtobool(headtime_condition.attrib.get('alongRoute', False))
+                    condition_freespace = strtobool(headtime_condition.attrib.get('freespace', 'false'))
+                    condition_along_route = strtobool(headtime_condition.attrib.get('alongRoute', 'false'))
 
                     for actor in actor_list:
                         if headtime_condition.attrib.get('entityRef', None) == actor.attributes['role_name']:
@@ -917,8 +918,8 @@ class OpenScenarioParser(object):
                     condition_target = ttc_condition.find('TimeToCollisionConditionTarget')
                     entity_ref_ = condition_target.find('EntityRef')
 
-                    condition_freespace = strtobool(ttc_condition.attrib.get('freespace', False))
-                    condition_along_route = strtobool(ttc_condition.attrib.get('alongRoute', False))
+                    condition_freespace = strtobool(ttc_condition.attrib.get('freespace', 'false'))
+                    condition_along_route = strtobool(ttc_condition.attrib.get('alongRoute', 'false'))
 
                     if condition_target.find('Position') is not None:
                         position = condition_target.find('Position')
@@ -990,11 +991,11 @@ class OpenScenarioParser(object):
                     distance_rule = distance_condition.attrib.get('rule')
                     distance_operator = OpenScenarioParser.operators[distance_rule]
 
-                    distance_freespace = strtobool(distance_condition.attrib.get('freespace', False))
+                    distance_freespace = strtobool(distance_condition.attrib.get('freespace', 'false'))
                     if distance_freespace:
                         raise NotImplementedError(
                             "DistanceCondition: freespace attribute is currently not implemented")
-                    distance_along_route = strtobool(distance_condition.attrib.get('alongRoute', False))
+                    distance_along_route = strtobool(distance_condition.attrib.get('alongRoute', 'false'))
 
                     if distance_condition.find('Position') is not None:
                         position = distance_condition.find('Position')
@@ -1296,6 +1297,25 @@ class OpenScenarioParser(object):
 
                     else:
                         raise AttributeError("Unknown target offset")
+                elif private_action.find('LateralDistanceAction') is not None:
+                    lat_maneuver = private_action.find('LateralDistanceAction')
+                    continuous = bool(strtobool(lat_maneuver.attrib.get('continuous', "false")))
+                    freespace = bool(strtobool(lat_maneuver.attrib.get('freespace', "false")))
+                    distance = ParameterRef(lat_maneuver.attrib.get('distance', float("inf")))
+                    constraints = lat_maneuver.find('DynamicConstraints')
+                    max_speed = constraints.attrib.get('maxSpeed', None) if constraints is not None else None
+                    relative_actor = None
+                    relative_actor_name = lat_maneuver.attrib.get('entityRef', None)
+                    for _actor in actor_list:
+                        if _actor is not None and 'role_name' in _actor.attributes:
+                            if relative_actor_name == _actor.attributes['role_name']:
+                                relative_actor = _actor
+                                break
+                    if relative_actor is None:
+                        raise AttributeError("Cannot find actor '{}' for condition".format(relative_actor_name))
+                    atomic = ChangeLateralDistance(actor, distance, relative_actor,
+                                                   continuous=continuous, freespace=freespace,
+                                                   name=maneuver_name)
                 else:
                     raise AttributeError("Unknown lateral action")
             elif private_action.find('VisibilityAction') is not None:
@@ -1319,15 +1339,15 @@ class OpenScenarioParser(object):
                 position = OpenScenarioParser.convert_position_to_transform(sync_action.find('TargetPosition'))
 
                 if sync_action.find("FinalSpeed").find("AbsoluteSpeed") is not None:
-                    final_speed = ParameterRef(sync_action.find("FinalSpeed").find(
-                        "AbsoluteSpeed").attrib.get('value', 0))
+                    final_speed = float(ParameterRef(sync_action.find("FinalSpeed").find(
+                        "AbsoluteSpeed").attrib.get('value', 0)))
                     atomic = SyncArrivalOSC(
                         actor, master_actor, position, master_position, final_speed, name=maneuver_name)
 
                 # relative velocity to given actor
                 elif sync_action.find("FinalSpeed").find("RelativeSpeedToMaster") is not None:
                     relative_speed = sync_action.find("FinalSpeed").find("RelativeSpeedToMaster")
-                    final_speed = ParameterRef(relative_speed.attrib.get('value', 0))
+                    final_speed = float(ParameterRef(relative_speed.attrib.get('value', 0)))
                     relative_type = relative_speed.attrib.get('speedTargetValueType')
                     atomic = SyncArrivalOSC(
                         actor, master_actor, position, master_position, final_speed,
@@ -1355,7 +1375,51 @@ class OpenScenarioParser(object):
                     waypoints = OpenScenarioParser.get_route(route_action, catalogs)
                     atomic = ChangeActorWaypoints(actor, waypoints=waypoints, name=maneuver_name)
                 elif private_action.find('FollowTrajectoryAction') is not None:
-                    raise NotImplementedError("Private FollowTrajectory actions are not yet supported")
+                    trajectory_action = private_action.find('FollowTrajectoryAction')
+                    trajectory = trajectory_action.find('Trajectory')
+                    waypoints = []
+                    vertices = []
+                    if trajectory is not None:
+                        shape = trajectory.find('Shape') or trajectory.find('Shapes')
+                        if shape is not None and shape.find('Polyline') is not None:
+                            for vertex in shape.find('Polyline').iter('Vertex'):
+                                pos = vertex.find('Position')
+                                if pos is not None:
+                                    waypoints.append((pos, 'shortest'))
+                                    vertices.append(vertex)
+
+                    # Derive target speed from the trajectory's relativeTime + WorldPosition
+                    # values, since ChangeActorWaypoints only sets waypoints — the underlying
+                    # controller's _target_speed stays at 0 and the actor never moves otherwise.
+                    target_speed = 10.0
+                    if len(vertices) >= 2:
+                        try:
+                            total_dist = 0.0
+                            for i in range(1, len(vertices)):
+                                p1 = vertices[i - 1].find('Position').find('WorldPosition')
+                                p2 = vertices[i].find('Position').find('WorldPosition')
+                                dx = float(p2.get('x')) - float(p1.get('x'))
+                                dy = float(p2.get('y')) - float(p1.get('y'))
+                                total_dist += math.sqrt(dx * dx + dy * dy)
+                            t0 = float(vertices[0].get('relativeTime', '0'))
+                            t1 = float(vertices[-1].get('relativeTime', '0'))
+                            if t1 - t0 > 0:
+                                target_speed = total_dist / (t1 - t0)
+                        except (TypeError, ValueError, AttributeError):
+                            pass
+
+                    # Run as a Sequence: set target speed first (SUCCESS immediately,
+                    # because update_target_speed() in initialise() persists on the
+                    # controller), then run ChangeActorWaypoints which moves the
+                    # actor along the route at the now non-zero speed.
+                    speed_atomic = ChangeActorTargetSpeed(
+                        actor, target_speed=target_speed, init_speed=True,
+                        name=maneuver_name + "_speed")
+                    waypoints_atomic = ChangeActorWaypoints(
+                        actor, waypoints=waypoints, name=maneuver_name + "_waypoints")
+                    atomic = py_trees.composites.Sequence(name=maneuver_name)
+                    atomic.add_child(speed_atomic)
+                    atomic.add_child(waypoints_atomic)
                 elif private_action.find('AcquirePositionAction') is not None:
                     route_action = private_action.find('AcquirePositionAction')
                     osc_position = route_action.find('Position')
